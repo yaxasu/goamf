@@ -1,6 +1,8 @@
 // Copyright 2011 baihaoping@gmail.com. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
+
+// Package amf implements a basic AMF3 decoder.
 package amf
 
 import (
@@ -18,113 +20,123 @@ type Decoder struct {
 	objectCache []reflect.Value
 }
 
-func NewDecoder(reader io.Reader) *Decoder {
-	decoder := new(Decoder)
-	decoder.reader = reader
-	decoder.Reset()
-	return decoder
+func NewDecoder(r io.Reader) *Decoder {
+	d := &Decoder{reader: r}
+	d.Reset()
+	return d
 }
 
-func (decoder *Decoder) Reset() {
-	decoder.objectCache = make([]reflect.Value, 0, 10)
-	decoder.stringCache = make([]string, 0, 10)
+func (d *Decoder) Reset() {
+	d.objectCache = make([]reflect.Value, 0, 10)
+	d.stringCache = make([]string, 0, 10)
 }
 
-func (decoder *Decoder) getField(key string, t reflect.Type) (reflect.StructField, bool) {
-	chars := []rune(key)
+/* ─────────────────────── helpers ─────────────────────── */
+
+func (d *Decoder) getField(key string, t reflect.Type) (reflect.StructField, bool) {
+	r := []rune(key)
 	upperKey := key
-	if unicode.IsLower(chars[0]) {
-		chars[0] = unicode.ToUpper(chars[0])
-		upperKey = string(chars)
+	if len(r) > 0 && unicode.IsLower(r[0]) {
+		r[0] = unicode.ToUpper(r[0])
+		upperKey = string(r)
 	}
 
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
-
-		if f.Name == upperKey {
+		if f.Name == upperKey || f.Tag.Get("amf.name") == key {
 			return f, true
 		}
-
-		if f.Tag.Get("amf.name") == key {
-			return f, true
-		}
-
 	}
-
-	return *new(reflect.StructField), false
+	return reflect.StructField{}, false
 }
 
-func (decoder *Decoder) decode(value reflect.Value) error {
-	
-	marker, err := decoder.readMarker()
+/* ─────────────────────── decode entry ─────────────────────── */
+
+func (d *Decoder) Decode(v AMFAny) error {
+	return d.decode(reflect.ValueOf(v))
+}
+
+func (d *Decoder) DecodeValue(v reflect.Value) error {
+	return d.decode(v)
+}
+
+func (d *Decoder) decode(value reflect.Value) error {
+	marker, err := d.readMarker()
 	if err != nil {
 		return err
 	}
 
-	//处理空指针的情况
+	/* ----- NULL handling ----- */
 	if marker == NULL_MARKER {
 		if value.IsNil() {
 			return nil
 		}
-
 		switch value.Kind() {
 		case reflect.Interface, reflect.Slice, reflect.Map, reflect.Ptr:
 			value.Set(reflect.Zero(value.Type()))
 			return nil
 		default:
-			return errors.New("invalid type:" + value.Type().String() + " for nil")
-		}
-	}
-	
-	if value.Kind() == reflect.Interface {
-		v := reflect.ValueOf(value.Interface())
-		if v.Kind() == reflect.Ptr {
-			value = v
+			return errors.New("invalid type: " + value.Type().String() + " for nil")
 		}
 	}
 
-	//如果当前为空指针则初始化
+	/* ----- Unwrap interface / pointer ----- */
+	if value.Kind() == reflect.Interface {
+		if v := reflect.ValueOf(value.Interface()); v.Kind() == reflect.Ptr {
+			value = v
+		}
+	}
 	for value.Kind() == reflect.Ptr {
 		if value.IsNil() {
 			value.Set(reflect.New(value.Type().Elem()))
 		}
 		value = value.Elem()
 	}
-	
+
+	/* ----- Dispatch by marker ----- */
 	switch marker {
 	case FALSE_MARKER:
-		return decoder.setBool(value, false)
+		return d.setBool(value, false)
 	case TRUE_MARKER:
-		return decoder.setBool(value, true)
+		return d.setBool(value, true)
 	case STRING_MARKER:
-		return decoder.readString(value)
+		return d.readString(value)
 	case DOUBLE_MARKER:
-		return decoder.readFloat(value)
+		return d.readFloat(value)
 	case INTEGER_MARKER:
-		return decoder.readInteger(value)
+		return d.readInteger(value)
 	case ARRAY_MARKER:
-		return decoder.readSlice(value)
+		return d.readSlice(value)
 	case OBJECT_MARKER:
-		return decoder.readObject(value)
+		return d.readObject(value)
 	default:
-		return errors.New("unsupported marker:" + strconv.Itoa(int(marker)))
+		return errors.New("unsupported marker: " + strconv.Itoa(int(marker)))
 	}
+}
 
+/* ───────────────────── primitives ───────────────────── */
+
+func (d *Decoder) setBool(value reflect.Value, v bool) error {
+	switch value.Kind() {
+	case reflect.Bool:
+		value.SetBool(v)
+	case reflect.Interface:
+		value.Set(reflect.ValueOf(v))
+	default:
+		return errors.New("invalid type: " + value.Type().String() + " for bool")
+	}
 	return nil
 }
 
-func (decoder *Decoder) readFloat(value reflect.Value) error {
-	bytes, err := decoder.readBytes(8)
+func (d *Decoder) readFloat(value reflect.Value) error {
+	bytes, err := d.readBytes(8)
 	if err != nil {
 		return err
 	}
-
-	n := uint64(0)
+	var n uint64
 	for _, b := range bytes {
-		n <<= 8
-		n |= uint64(b)
+		n = (n << 8) | uint64(b)
 	}
-
 	v := math.Float64frombits(n)
 
 	switch value.Kind() {
@@ -137,21 +149,18 @@ func (decoder *Decoder) readFloat(value reflect.Value) error {
 	case reflect.Interface:
 		value.Set(reflect.ValueOf(v))
 	default:
-		return errors.New("invalid type:" + value.Type().String() + " for double")
+		return errors.New("invalid type: " + value.Type().String() + " for double")
 	}
-
 	return nil
 }
 
-func (decoder *Decoder) readInteger(value reflect.Value) error {
-
-	uv, err := decoder.readU29()
+func (d *Decoder) readInteger(value reflect.Value) error {
+	uv, err := d.readU29()
 	if err != nil {
 		return err
 	}
-
 	vv := int32(uv)
-	if uv > 0xfffffff {
+	if uv > 0x0fffffff {
 		vv = int32(uv - 0x20000000)
 	}
 
@@ -163,239 +172,196 @@ func (decoder *Decoder) readInteger(value reflect.Value) error {
 	case reflect.Interface:
 		value.Set(reflect.ValueOf(uv))
 	default:
-		return errors.New("invalid type:" + value.Type().String() + " for integer")
+		return errors.New("invalid type: " + value.Type().String() + " for integer")
 	}
-
 	return nil
 }
 
-func (decoder *Decoder) readString(value reflect.Value) error {
+/* ───────────────────── strings ───────────────────── */
 
-	index, err := decoder.readU29()
+func (d *Decoder) readString(value reflect.Value) error {
+	index, err := d.readU29()
 	if err != nil {
 		return err
 	}
 
-	ret := ""
+	var s string
 	if (index & 0x01) == 0 {
-		ret = decoder.stringCache[int(index>>1)]
+		s = d.stringCache[int(index>>1)]
 	} else {
 		index >>= 1
-		bytes, err := decoder.readBytes(int(index))
+		bytes, err := d.readBytes(int(index))
 		if err != nil {
 			return err
 		}
-
-		ret = string(bytes)
-	}
-	
-	if ret != "" {
-		decoder.stringCache = append(decoder.stringCache, ret)
+		s = string(bytes)
+		if s != "" {
+			d.stringCache = append(d.stringCache, s)
+		}
 	}
 
 	switch value.Kind() {
 	case reflect.Int, reflect.Int32, reflect.Int64:
-		num, err := strconv.Atoi64(ret)
+		num, err := strconv.ParseInt(s, 10, 64)
 		if err != nil {
 			return err
 		}
-
 		value.SetInt(num)
 	case reflect.Uint, reflect.Uint32, reflect.Uint64:
-		num, err := strconv.Atoui64(ret)
+		num, err := strconv.ParseUint(s, 10, 64)
 		if err != nil {
 			return err
 		}
-
 		value.SetUint(num)
 	case reflect.String:
-		value.SetString(ret)
+		value.SetString(s)
 	case reflect.Interface:
-		value.Set(reflect.ValueOf(ret))
+		value.Set(reflect.ValueOf(s))
 	default:
-		return errors.New("invalid type:" + value.Type().String() + " for string")
+		return errors.New("invalid type: " + value.Type().String() + " for string")
 	}
-
 	return nil
 }
 
-func (decoder *Decoder) readObject(value reflect.Value) error {
+/* ───────────────────── compound (object / slice) ───────────────────── */
 
-	index, err := decoder.readU29()
+func (d *Decoder) readObject(value reflect.Value) error {
+	index, err := d.readU29()
 	if err != nil {
 		return err
 	}
 
+	/* ----- object reference ----- */
 	if (index & 0x01) == 0 {
-		value.Set(decoder.objectCache[int(index>>1)])
+		value.Set(d.objectCache[int(index>>1)])
 		return nil
 	}
 
+	/* ----- dynamic anonymous object ----- */
 	if index != 0x0b {
 		return errors.New("invalid object type")
 	}
-
-	sep, err := decoder.readMarker()
+	sep, err := d.readMarker()
 	if err != nil {
 		return err
 	}
-
 	if sep != 0x01 {
-		return errors.New("type object not allowed")
+		return errors.New("typed object not supported")
 	}
 
+	/* Interface → map[string]AMFAny */
 	if value.Kind() == reflect.Interface {
 		var dummy map[string]AMFAny
-		v := reflect.MakeMap(reflect.TypeOf(dummy))
-		value.Set(v)
-		value = v
+		m := reflect.MakeMap(reflect.TypeOf(dummy))
+		value.Set(m)
+		value = m
 	}
 
+	/* ------ Map target ------ */
 	if value.Kind() == reflect.Map {
 		if value.IsNil() {
-			v := reflect.MakeMap(value.Type())
-			value.Set(v)
-			value = v
+			m := reflect.MakeMap(value.Type())
+			value.Set(m)
+			value = m
 		}
-		
-		decoder.objectCache = append(decoder.objectCache, value)
+		d.objectCache = append(d.objectCache, value)
 
 		for {
-			key := ""
-			err = decoder.readString(reflect.ValueOf(&key).Elem())
-			if err != nil {
+			var k string
+			if err := d.readString(reflect.ValueOf(&k).Elem()); err != nil {
 				return err
 			}
-			
-
-			if key == "" {
+			if k == "" {
 				break
 			}
-
-			v := reflect.New(value.Type().Elem())
-			err = decoder.decode(v)
-			if err != nil {
+			elem := reflect.New(value.Type().Elem())
+			if err := d.decode(elem); err != nil {
 				return err
 			}
-
-			value.SetMapIndex(reflect.ValueOf(key), v.Elem())
+			value.SetMapIndex(reflect.ValueOf(k), elem.Elem())
 		}
-		
 		return nil
 	}
 
+	/* ------ Struct target ------ */
 	if value.Kind() != reflect.Struct {
-		return errors.New("struct type expected, found:" + value.Type().String())
+		return errors.New("struct expected, found: " + value.Type().String())
 	}
-	
-
-	decoder.objectCache = append(decoder.objectCache, value)
+	d.objectCache = append(d.objectCache, value)
 
 	for {
-	
-		key := ""
-		err = decoder.readString(reflect.ValueOf(&key).Elem())
-		if err != nil {
+		var key string
+		if err := d.readString(reflect.ValueOf(&key).Elem()); err != nil {
 			return err
 		}
-		
 		if key == "" {
 			break
 		}
-
-		f, ok := decoder.getField(key, value.Type())
+		f, ok := d.getField(key, value.Type())
 		if !ok {
-			return errors.New("key:" + key + " not found in struct:" + value.Type().String())
+			return errors.New("key " + key + " not found in struct " + value.Type().String())
 		}
-		
-		err = decoder.decode(value.FieldByName(f.Name))
-		if err != nil {
+		if err := d.decode(value.FieldByName(f.Name)); err != nil {
 			return err
 		}
 	}
-	
 	return nil
 }
 
-func (decoder *Decoder) readSlice(value reflect.Value) error {
-
-	index, err := decoder.readU29()
+func (d *Decoder) readSlice(value reflect.Value) error {
+	index, err := d.readU29()
 	if err != nil {
 		return err
 	}
 
+	/* ----- slice reference ----- */
 	if (index & 0x01) == 0 {
-		slice := decoder.objectCache[int(index>>1)]
-		value.Set(slice)
+		value.Set(d.objectCache[int(index>>1)])
 		return nil
 	}
-
 	index >>= 1
-	sep, err := decoder.readMarker()
+
+	sep, err := d.readMarker()
 	if err != nil {
 		return err
 	}
-
 	if sep != 0x01 {
-		return errors.New("ecma array not allowed")
+		return errors.New("ECMA array not allowed")
 	}
-	
+
+	/* Ensure we have a concrete slice or []AMFAny */
 	if value.IsNil() {
 		var v reflect.Value
-		if value.Type().Kind() == reflect.Slice {
+		switch value.Type().Kind() {
+		case reflect.Slice:
 			v = reflect.MakeSlice(value.Type(), int(index), int(index))
-		} else if value.Type().Kind() == reflect.Interface {
-			v = reflect.ValueOf(make([]AMFAny,int(index), int(index)))
-		} else {
-			return errors.New("invalid type:" + value.Type().String() + " for array")
+		case reflect.Interface:
+			v = reflect.ValueOf(make([]AMFAny, int(index)))
+		default:
+			return errors.New("invalid type: " + value.Type().String() + " for array")
 		}
 		value.Set(v)
 		value = v
 	}
-	
-	decoder.objectCache = append(decoder.objectCache, value)
-	
+	d.objectCache = append(d.objectCache, value)
+
 	for i := 0; i < int(index); i++ {
-		c := value.Index(i)
-		err = decoder.decode(c)
-		if err != nil {
+		if err := d.decode(value.Index(i)); err != nil {
 			return err
 		}
 	}
-	
 	return nil
 }
 
-func (decoder *Decoder) setBool(value reflect.Value, v bool) error {
+/* ───────────────────── low-level IO ───────────────────── */
 
-	switch value.Kind() {
-		case reflect.Bool:
-		value.SetBool(v)
-	case reflect.Interface:
-		value.Set(reflect.ValueOf(v))
-	default:
-		return errors.New("invalid type:" + value.Type().String() + " for bool")
-	}
-	return nil
-}
-
-func (decoder *Decoder) Decode(value AMFAny) error {
-	return decoder.decode(reflect.ValueOf(value))
-}
-
-func (decoder *Decoder) DecodeValue(value reflect.Value) error {
-	return decoder.decode(value)
-}
-
-func (decoder *Decoder) readU29() (uint32, error) {
-
-	var ret uint32 = 0
+func (d *Decoder) readU29() (uint32, error) {
+	var ret uint32
 	for i := 0; i < 4; i++ {
-		b, err := decoder.readMarker()
+		b, err := d.readMarker()
 		if err != nil {
 			return 0, err
 		}
-
 		if i != 3 {
 			ret = (ret << 7) | uint32(b&0x7f)
 			if (b & 0x80) == 0 {
@@ -405,28 +371,25 @@ func (decoder *Decoder) readU29() (uint32, error) {
 			ret = (ret << 8) | uint32(b)
 		}
 	}
-
 	return ret, nil
 }
 
-func (decoder *Decoder) readBytes(length int) ([]byte, error) {
-	buffer := make([]byte, length)
-	for length != 0 {
-		l, err := decoder.reader.Read(buffer)
+func (d *Decoder) readBytes(n int) ([]byte, error) {
+	buf := make([]byte, n)
+	for n > 0 {
+		read, err := d.reader.Read(buf[len(buf)-n:])
 		if err != nil {
 			return nil, err
 		}
-		length -= l
+		n -= read
 	}
-
-	return buffer, nil
+	return buf, nil
 }
 
-func (decoder *Decoder) readMarker() (byte, error) {
-	bytes, err := decoder.readBytes(1)
+func (d *Decoder) readMarker() (byte, error) {
+	b, err := d.readBytes(1)
 	if err != nil {
 		return 0, err
 	}
-
-	return bytes[0], nil
+	return b[0], nil
 }

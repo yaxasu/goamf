@@ -1,6 +1,7 @@
 // Copyright 2011 baihaoping@gmail.com. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
+
 package amf
 
 import (
@@ -19,364 +20,280 @@ type Encoder struct {
 	reservStruct bool
 }
 
-func (encoder *Encoder) Reset(){
-	encoder.objectCache = make(map[uintptr]int)
-	encoder.stringCache = make(map[string]int)
+/* ───────────────────── lifecycle ───────────────────── */
+
+func NewEncoder(w io.Writer, reservStruct bool) *Encoder {
+	e := &Encoder{writer: w, reservStruct: reservStruct}
+	e.Reset()
+	return e
 }
 
-func (encoder *Encoder) getFieldName(f reflect.StructField) string {
-	chars := []rune(f.Name)
-	if unicode.IsLower(chars[0]) {
+func (e *Encoder) Reset() {
+	e.objectCache = make(map[uintptr]int)
+	e.stringCache = make(map[string]int)
+}
+
+/* ───────────────────── helpers ───────────────────── */
+
+func (e *Encoder) getFieldName(f reflect.StructField) string {
+	r := []rune(f.Name)
+	if unicode.IsLower(r[0]) {
 		return ""
 	}
 
-	name := f.Tag.Get("amf.name")
-	if name != "" {
-		return name
+	if tag := f.Tag.Get("amf.name"); tag != "" {
+		return tag
 	}
 
-	if !encoder.reservStruct {
-		chars[0] = unicode.ToLower(chars[0])
-		return string(chars)
+	if !e.reservStruct {
+		r[0] = unicode.ToLower(r[0])
+		return string(r)
 	}
-
 	return f.Name
 }
 
-func (encoder *Encoder) encodeBool(value bool) error {
-
-	buffer := make([]byte, 1)
-	if value {
-		buffer[0] = TRUE_MARKER
-	} else {
-		buffer[0] = FALSE_MARKER
+func (e *Encoder) writeBytes(b []byte) error {
+	if n, err := e.writer.Write(b); n != len(b) || err != nil {
+		return errors.New("write failed")
 	}
-
-	return encoder.writeBytes(buffer)
-}
-
-func (encoder *Encoder) encodeNull() error {
-
-	return encoder.writeMarker(NULL_MARKER)
-}
-
-func (encoder *Encoder) encodeUint(value uint64) error {
-
-	if value >= 0x20000000 {
-		if value <= 0xffffffff {
-			return encoder.encodeFloat(float64(value))
-		}
-
-		return encoder.encodeString(strconv.Uitoa64(value))
-	}
-
-	err := encoder.writeMarker(INTEGER_MARKER)
-	if err != nil {
-		return err
-	}
-
-	return encoder.writeU29(uint32(value))
-}
-
-func (encoder *Encoder) encodeInt(value int64) error {
-
-	if value < -0xfffffff {
-		if value > -0x7fffffff {
-			return encoder.encodeFloat(float64(value))
-		}
-		return encoder.encodeString(strconv.Itoa64(value))
-	}
-
-	err := encoder.writeMarker(INTEGER_MARKER)
-	if err != nil {
-		return err
-	}
-
-	return encoder.writeU29(uint32(value))
-}
-
-func (encoder *Encoder) encodeFloat(value float64) error {
-
-	buffer := make([]byte, 9)
-
-	buffer[0] = DOUBLE_MARKER
-	intValue := math.Float64bits(float64(value))
-
-	buffer[1] = byte((intValue >> 56) & 0xff)
-	buffer[2] = byte((intValue >> 48) & 0xff)
-	buffer[3] = byte((intValue >> 40) & 0xff)
-	buffer[4] = byte((intValue >> 32) & 0xff)
-	buffer[5] = byte((intValue >> 24) & 0xff)
-	buffer[6] = byte((intValue >> 16) & 0xff)
-	buffer[7] = byte((intValue >> 8) & 0xff)
-	buffer[8] = byte(intValue & 0xff)
-
-	return encoder.writeBytes(buffer)
-}
-
-func (encoder *Encoder) encodeString(value string) error {
-
-	err := encoder.writeMarker(STRING_MARKER)
-	if err != nil {
-		return err
-	}
-
-	return encoder.writeString(value)
-}
-
-func (encoder *Encoder) encodeMap(value reflect.Value) error {
-
-	err := encoder.writeMarker(OBJECT_MARKER)
-	if err != nil {
-		return err
-	}
-
-	index, ok := encoder.objectCache[value.Pointer()]
-	if ok {
-		index <<= 1
-		encoder.writeU29(uint32(index << 1))
-		return nil
-	}
-
-	err = encoder.writeMarker(0x0b)
-	if err != nil {
-		return err
-	}
-
-	err = encoder.writeString("")
-	if err != nil {
-		return err
-	}
-
-	keys := value.MapKeys()
-	for i := 0; i < len(keys); i++ {
-		key := keys[i]
-		if key.Kind() != reflect.String {
-			return errors.New("only string key allowed in map")
-		}
-
-		err = encoder.writeString(key.String())
-		if err != nil {
-			return err
-		}
-
-		v := value.MapIndex(key)
-		if v.Kind() == reflect.Struct {
-			v = v.Addr()
-		}
-
-		err = encoder.encode(v)
-		if err != nil {
-			return err
-		}
-	}
-
-	return encoder.writeString("")
-}
-
-func (encoder *Encoder) encodeStruct(value reflect.Value) error {
-
-	err := encoder.writeMarker(OBJECT_MARKER)
-	if err != nil {
-		return err
-	}
-
-	index, ok := encoder.objectCache[value.Pointer()]
-	if ok {
-		index <<= 1
-		encoder.writeU29(uint32(index << 1))
-		return nil
-	}
-
-	err = encoder.writeMarker(0x0b)
-	if err != nil {
-		return err
-	}
-
-	err = encoder.writeString("")
-	if err != nil {
-		return err
-	}
-
-	v := reflect.Indirect(value)
-	t := v.Type()
-	switch t.Kind() {
-	case reflect.Struct:
-		for i := 0; i < t.NumField(); i++ {
-			f := t.Field(i)
-			key := encoder.getFieldName(f)
-			if key == "" {
-				continue
-			}
-
-			err = encoder.writeString(key)
-			if err != nil {
-				return err
-			}
-
-			fv := v.FieldByName(f.Name)
-			if fv.Kind() == reflect.Struct {
-				fv = fv.Addr()
-			}
-
-			err = encoder.encode(fv)
-			if err != nil {
-				return err
-			}
-		}
-	default:
-		panic("not a struct")
-	}
-
-	return encoder.writeString("")
-}
-
-func (encoder *Encoder) encodeSlice(value reflect.Value) error {
-
-	err := encoder.writeMarker(ARRAY_MARKER)
-	if err != nil {
-		return err
-	}
-
-	index, ok := encoder.objectCache[value.Pointer()]
-	if ok {
-		index <<= 1
-		encoder.writeU29(uint32(index << 1))
-		return nil
-	}
-
-	err = encoder.writeU29((uint32(value.Len()) << 1) | 0x01)
-	if err != nil {
-		return err
-	}
-
-	//FIXME 这里未实现ECMA数组
-
-	err = encoder.writeString("")
-	if err != nil {
-		return err
-	}
-
-	for i := 0; i < value.Len(); i++ {
-
-		v := value.Index(i)
-		if v.Kind() == reflect.Struct {
-			v = v.Addr()
-		}
-		err = encoder.encode(v)
-		if err != nil {
-			return err
-		}
-	}
-
 	return nil
 }
 
-func (encoder *Encoder) encode(v reflect.Value) error {
+func (e *Encoder) writeMarker(m byte) error { return e.writeBytes([]byte{m}) }
 
-	switch v.Kind() {
-	case reflect.Map:
-		return encoder.encodeMap(v)
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		return encoder.encodeUint(v.Uint())
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return encoder.encodeInt(v.Int())
-	case reflect.String:
-		return encoder.encodeString(v.String())
-	case reflect.Array:
-		v = v.Slice(0, v.Len())
-		return encoder.encodeSlice(v)
-	case reflect.Slice:
-		return encoder.encodeSlice(v)
-	case reflect.Float64, reflect.Float32:
-		return encoder.encodeFloat(v.Float())
-	case reflect.Interface:
-		v = reflect.ValueOf(v.Interface())
-		return encoder.encode(v)
-	case reflect.Ptr:
-		if v.IsNil() {
-			return encoder.encodeNull()
-		}
-		vv := reflect.Indirect(v)
-		if vv.Kind() == reflect.Struct {
-			return encoder.encodeStruct(v)
-		}
-		return encoder.encode(vv)
+/* ───────────────────── primitive encoders ───────────────────── */
+
+func (e *Encoder) encodeBool(v bool) error {
+	if v {
+		return e.writeMarker(TRUE_MARKER)
 	}
-
-	return errors.New("unsupported type:" + v.Type().String())
+	return e.writeMarker(FALSE_MARKER)
 }
 
-func (encoder *Encoder) Encode(value AMFAny) error {
+func (e *Encoder) encodeNull() error { return e.writeMarker(NULL_MARKER) }
 
-	v := reflect.ValueOf(value)
-	return encoder.encode(v)
-}
-
-func (encoder *Encoder) writeString(value string) error {
-
-	index, ok := encoder.stringCache[value]
-	if ok {
-		encoder.writeU29(uint32(index << 1))
-		return nil
+func (e *Encoder) encodeUint(v uint64) error {
+	if v >= 0x20000000 {
+		if v <= 0xffffffff {
+			return e.encodeFloat(float64(v))
+		}
+		return e.encodeString(strconv.FormatUint(v, 10)) // ✨ fixed
 	}
 
-	err := encoder.writeU29(uint32((len(value) << 1) | 0x01))
-	if err != nil {
+	if err := e.writeMarker(INTEGER_MARKER); err != nil {
+		return err
+	}
+	return e.writeU29(uint32(v))
+}
+
+func (e *Encoder) encodeInt(v int64) error {
+	if v < -0x0fffffff {
+		if v > -0x7fffffff {
+			return e.encodeFloat(float64(v))
+		}
+		return e.encodeString(strconv.FormatInt(v, 10)) // ✨ fixed
+	}
+
+	if err := e.writeMarker(INTEGER_MARKER); err != nil {
+		return err
+	}
+	return e.writeU29(uint32(v))
+}
+
+func (e *Encoder) encodeFloat(v float64) error {
+	buf := make([]byte, 9)
+	buf[0] = DOUBLE_MARKER
+	u := math.Float64bits(v)
+	for i := 8; i > 0; i-- {
+		buf[i] = byte(u & 0xff)
+		u >>= 8
+	}
+	return e.writeBytes(buf)
+}
+
+func (e *Encoder) encodeString(s string) error {
+	if err := e.writeMarker(STRING_MARKER); err != nil {
+		return err
+	}
+	return e.writeString(s)
+}
+
+/* ───────────────────── compound encoders ───────────────────── */
+
+func (e *Encoder) encodeMap(v reflect.Value) error {
+	if err := e.writeMarker(OBJECT_MARKER); err != nil {
 		return err
 	}
 
-	if value != "" {
-		encoder.stringCache[value] = len(encoder.stringCache)
+	if idx, ok := e.objectCache[v.Pointer()]; ok {
+		return e.writeU29(uint32(idx << 2)) // ((idx<<1)|0x01)<<1
 	}
-	return encoder.writeBytes([]byte(value))
-}
 
-func (encoder *Encoder) writeMarker(value byte) error {
-
-	return encoder.writeBytes([]byte{value})
-}
-
-func (encoder *Encoder) writeBytes(bytes []byte) error {
-
-	length, err := encoder.writer.Write(bytes)
-	if length != len(bytes) || err != nil {
-		return errors.New("write data failed")
+	e.objectCache[v.Pointer()] = len(e.objectCache)
+	if err := e.writeMarker(0x0b); err != nil {
+		return err
 	}
-	return err
+	if err := e.writeString(""); err != nil { // dynamic type marker
+		return err
+	}
+
+	for _, k := range v.MapKeys() {
+		if k.Kind() != reflect.String {
+			return errors.New("map key must be string")
+		}
+		if err := e.writeString(k.String()); err != nil {
+			return err
+		}
+		elem := v.MapIndex(k)
+		if elem.Kind() == reflect.Struct {
+			elem = elem.Addr()
+		}
+		if err := e.encode(elem); err != nil {
+			return err
+		}
+	}
+	return e.writeString("")
 }
 
-func (encoder *Encoder) writeU29(value uint32) error {
+func (e *Encoder) encodeStruct(v reflect.Value) error {
+	if err := e.writeMarker(OBJECT_MARKER); err != nil {
+		return err
+	}
 
-	buffer := make([]byte, 0, 4)
+	if idx, ok := e.objectCache[v.Pointer()]; ok {
+		return e.writeU29(uint32(idx << 2))
+	}
+	e.objectCache[v.Pointer()] = len(e.objectCache)
 
-	switch {
-	case value < 0x80:
-		buffer = append(buffer, byte(value))
-	case value < 0x4000:
-		buffer = append(buffer, byte((value>>7)|0x80))
-		buffer = append(buffer, byte(value&0x7f))
-	case value < 0x200000:
-		buffer = append(buffer, byte((value>>14)|0x80))
-		buffer = append(buffer, byte((value>>7)|0x80))
-		buffer = append(buffer, byte(value&0x7f))
-	case value < 0x20000000:
-		buffer = append(buffer, byte((value>>22)|0x80))
-		buffer = append(buffer, byte((value>>15)|0x80))
-		buffer = append(buffer, byte((value>>7)|0x80))
-		buffer = append(buffer, byte(value&0xff))
+	if err := e.writeMarker(0x0b); err != nil {
+		return err
+	}
+	if err := e.writeString(""); err != nil { // dynamic
+		return err
+	}
+
+	sv := v.Elem()
+	st := sv.Type()
+	for i := 0; i < st.NumField(); i++ {
+		f := st.Field(i)
+		name := e.getFieldName(f)
+		if name == "" {
+			continue
+		}
+		if err := e.writeString(name); err != nil {
+			return err
+		}
+		fv := sv.Field(i)
+		if fv.Kind() == reflect.Struct {
+			fv = fv.Addr()
+		}
+		if err := e.encode(fv); err != nil {
+			return err
+		}
+	}
+	return e.writeString("")
+}
+
+func (e *Encoder) encodeSlice(v reflect.Value) error {
+	if err := e.writeMarker(ARRAY_MARKER); err != nil {
+		return err
+	}
+
+	if idx, ok := e.objectCache[v.Pointer()]; ok {
+		return e.writeU29(uint32(idx << 2))
+	}
+	e.objectCache[v.Pointer()] = len(e.objectCache)
+
+	if err := e.writeU29(uint32(v.Len())<<1 | 0x01); err != nil {
+		return err
+	}
+	if err := e.writeString(""); err != nil { // no ECMA array part
+		return err
+	}
+
+	for i := 0; i < v.Len(); i++ {
+		elem := v.Index(i)
+		if elem.Kind() == reflect.Struct {
+			elem = elem.Addr()
+		}
+		if err := e.encode(elem); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+/* ───────────────────── dispatcher ───────────────────── */
+
+func (e *Encoder) encode(v reflect.Value) error {
+	switch v.Kind() {
+	case reflect.Map:
+		return e.encodeMap(v)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return e.encodeUint(v.Uint())
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return e.encodeInt(v.Int())
+	case reflect.String:
+		return e.encodeString(v.String())
+	case reflect.Array:
+		return e.encodeSlice(v.Slice(0, v.Len()))
+	case reflect.Slice:
+		return e.encodeSlice(v)
+	case reflect.Float32, reflect.Float64:
+		return e.encodeFloat(v.Float())
+	case reflect.Interface:
+		return e.encode(reflect.ValueOf(v.Interface()))
+	case reflect.Ptr:
+		if v.IsNil() {
+			return e.encodeNull()
+		}
+		if v.Elem().Kind() == reflect.Struct {
+			return e.encodeStruct(v)
+		}
+		return e.encode(v.Elem())
 	default:
-		return errors.New("u29 over flow")
+		return errors.New("unsupported type: " + v.Type().String())
 	}
-
-	return encoder.writeBytes(buffer)
 }
 
-func NewEncoder(writer io.Writer, reservStruct bool) *Encoder {
+func (e *Encoder) Encode(v AMFAny) error { return e.encode(reflect.ValueOf(v)) }
 
-	encoder := new(Encoder)
-	encoder.writer = writer
-	encoder.reservStruct = reservStruct
-	encoder.Reset()
-	return encoder
+/* ───────────────────── low-level write helpers ───────────────────── */
+
+func (e *Encoder) writeString(s string) error {
+	if idx, ok := e.stringCache[s]; ok {
+		return e.writeU29(uint32(idx << 1))
+	}
+
+	if err := e.writeU29(uint32(len(s)<<1 | 0x01)); err != nil {
+		return err
+	}
+	if s != "" {
+		e.stringCache[s] = len(e.stringCache)
+	}
+	return e.writeBytes([]byte(s))
+}
+
+func (e *Encoder) writeU29(v uint32) error {
+	switch {
+	case v < 0x80:
+		return e.writeBytes([]byte{byte(v)})
+	case v < 0x4000:
+		return e.writeBytes([]byte{byte((v >> 7) | 0x80), byte(v & 0x7f)})
+	case v < 0x200000:
+		return e.writeBytes([]byte{
+			byte((v >> 14) | 0x80),
+			byte((v >> 7) | 0x80),
+			byte(v & 0x7f),
+		})
+	case v < 0x20000000:
+		return e.writeBytes([]byte{
+			byte((v >> 22) | 0x80),
+			byte((v >> 15) | 0x80),
+			byte((v >> 7) | 0x80),
+			byte(v & 0xff),
+		})
+	default:
+		return errors.New("u29 overflow")
+	}
 }
