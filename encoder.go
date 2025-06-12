@@ -125,7 +125,8 @@ func (e *Encoder) encodeMap(v reflect.Value) error {
 	}
 	e.objectCache[v.Pointer()] = len(e.objectCache)
 
-	if err := e.writeMarker(0x0b); err != nil { // dynamic object flag
+	// dynamic object flag
+	if err := e.writeMarker(0x0b); err != nil {
 		return err
 	}
 	if err := e.writeString(""); err != nil {
@@ -142,15 +143,12 @@ func (e *Encoder) encodeMap(v reflect.Value) error {
 
 		elem := v.MapIndex(k)
 
-		// make sure struct values are addressable
+		// Map elements are never addressable; if it's a struct, always copy it into
+		// an addressable wrapper so downstream code can take its address safely.
 		if elem.Kind() == reflect.Struct {
-			if !elem.CanAddr() {
-				ptr := reflect.New(elem.Type())
-				ptr.Elem().Set(elem)
-				elem = ptr
-			} else {
-				elem = elem.Addr()
-			}
+			ptr := reflect.New(elem.Type())
+			ptr.Elem().Set(elem)
+			elem = ptr // treat as *Struct for further encoding
 		}
 		if err := e.encode(elem); err != nil {
 			return err
@@ -237,7 +235,7 @@ func (e *Encoder) encode(v reflect.Value) error {
 		return e.encodeUint(v.Uint())
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		return e.encodeInt(v.Int())
-	case reflect.Bool: // <-- added
+	case reflect.Bool:
 		return e.encodeBool(v.Bool())
 	case reflect.String:
 		return e.encodeString(v.String())
