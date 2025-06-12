@@ -1,6 +1,5 @@
-// Copyright 2011 baihaoping@gmail.com. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright 2011 baihaoping@gmail.com.
+// BSD-style license; see LICENSE file.
 
 package amf
 
@@ -20,7 +19,7 @@ type Encoder struct {
 	reservStruct bool
 }
 
-/* ───────────────────── lifecycle ───────────────────── */
+/* ───── lifecycle ───── */
 
 func NewEncoder(w io.Writer, reservStruct bool) *Encoder {
 	e := &Encoder{writer: w, reservStruct: reservStruct}
@@ -33,18 +32,16 @@ func (e *Encoder) Reset() {
 	e.stringCache = make(map[string]int)
 }
 
-/* ───────────────────── helpers ───────────────────── */
+/* ───── helpers ───── */
 
 func (e *Encoder) getFieldName(f reflect.StructField) string {
 	r := []rune(f.Name)
 	if unicode.IsLower(r[0]) {
 		return ""
 	}
-
 	if tag := f.Tag.Get("amf.name"); tag != "" {
 		return tag
 	}
-
 	if !e.reservStruct {
 		r[0] = unicode.ToLower(r[0])
 		return string(r)
@@ -61,7 +58,7 @@ func (e *Encoder) writeBytes(b []byte) error {
 
 func (e *Encoder) writeMarker(m byte) error { return e.writeBytes([]byte{m}) }
 
-/* ───────────────────── primitive encoders ───────────────────── */
+/* ───── primitive encoders ───── */
 
 func (e *Encoder) encodeBool(v bool) error {
 	if v {
@@ -77,9 +74,8 @@ func (e *Encoder) encodeUint(v uint64) error {
 		if v <= 0xffffffff {
 			return e.encodeFloat(float64(v))
 		}
-		return e.encodeString(strconv.FormatUint(v, 10)) // ✨ fixed
+		return e.encodeString(strconv.FormatUint(v, 10))
 	}
-
 	if err := e.writeMarker(INTEGER_MARKER); err != nil {
 		return err
 	}
@@ -91,9 +87,8 @@ func (e *Encoder) encodeInt(v int64) error {
 		if v > -0x7fffffff {
 			return e.encodeFloat(float64(v))
 		}
-		return e.encodeString(strconv.FormatInt(v, 10)) // ✨ fixed
+		return e.encodeString(strconv.FormatInt(v, 10))
 	}
-
 	if err := e.writeMarker(INTEGER_MARKER); err != nil {
 		return err
 	}
@@ -118,7 +113,7 @@ func (e *Encoder) encodeString(s string) error {
 	return e.writeString(s)
 }
 
-/* ───────────────────── compound encoders ───────────────────── */
+/* ───── compound encoders ───── */
 
 func (e *Encoder) encodeMap(v reflect.Value) error {
 	if err := e.writeMarker(OBJECT_MARKER); err != nil {
@@ -126,14 +121,14 @@ func (e *Encoder) encodeMap(v reflect.Value) error {
 	}
 
 	if idx, ok := e.objectCache[v.Pointer()]; ok {
-		return e.writeU29(uint32(idx << 2)) // ((idx<<1)|0x01)<<1
+		return e.writeU29(uint32(idx << 2)) // ((idx<<1)|1)<<1
 	}
-
 	e.objectCache[v.Pointer()] = len(e.objectCache)
-	if err := e.writeMarker(0x0b); err != nil {
+
+	if err := e.writeMarker(0x0b); err != nil { // dynamic object flag
 		return err
 	}
-	if err := e.writeString(""); err != nil { // dynamic type marker
+	if err := e.writeString(""); err != nil {
 		return err
 	}
 
@@ -144,15 +139,24 @@ func (e *Encoder) encodeMap(v reflect.Value) error {
 		if err := e.writeString(k.String()); err != nil {
 			return err
 		}
+
 		elem := v.MapIndex(k)
+
+		// make sure struct values are addressable
 		if elem.Kind() == reflect.Struct {
-			elem = elem.Addr()
+			if !elem.CanAddr() {
+				ptr := reflect.New(elem.Type())
+				ptr.Elem().Set(elem)
+				elem = ptr
+			} else {
+				elem = elem.Addr()
+			}
 		}
 		if err := e.encode(elem); err != nil {
 			return err
 		}
 	}
-	return e.writeString("")
+	return e.writeString("") // end-of-object marker
 }
 
 func (e *Encoder) encodeStruct(v reflect.Value) error {
@@ -207,7 +211,7 @@ func (e *Encoder) encodeSlice(v reflect.Value) error {
 	if err := e.writeU29(uint32(v.Len())<<1 | 0x01); err != nil {
 		return err
 	}
-	if err := e.writeString(""); err != nil { // no ECMA array part
+	if err := e.writeString(""); err != nil { // no ECMA part
 		return err
 	}
 
@@ -223,7 +227,7 @@ func (e *Encoder) encodeSlice(v reflect.Value) error {
 	return nil
 }
 
-/* ───────────────────── dispatcher ───────────────────── */
+/* ───── dispatcher ───── */
 
 func (e *Encoder) encode(v reflect.Value) error {
 	switch v.Kind() {
@@ -233,6 +237,8 @@ func (e *Encoder) encode(v reflect.Value) error {
 		return e.encodeUint(v.Uint())
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		return e.encodeInt(v.Int())
+	case reflect.Bool: // <-- added
+		return e.encodeBool(v.Bool())
 	case reflect.String:
 		return e.encodeString(v.String())
 	case reflect.Array:
@@ -258,13 +264,12 @@ func (e *Encoder) encode(v reflect.Value) error {
 
 func (e *Encoder) Encode(v AMFAny) error { return e.encode(reflect.ValueOf(v)) }
 
-/* ───────────────────── low-level write helpers ───────────────────── */
+/* ───── low-level helpers ───── */
 
 func (e *Encoder) writeString(s string) error {
 	if idx, ok := e.stringCache[s]; ok {
 		return e.writeU29(uint32(idx << 1))
 	}
-
 	if err := e.writeU29(uint32(len(s)<<1 | 0x01)); err != nil {
 		return err
 	}
